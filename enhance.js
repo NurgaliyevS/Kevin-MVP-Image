@@ -264,6 +264,21 @@ async function removeBackground(inputPath, outputPath) {
   }
 }
 
+// Post-process: auto-crop, center, and ensure pure white background
+async function postProcessImage(inputPath, outputPath) {
+  // Open the image
+  const image = sharp(inputPath);
+  // Get alpha channel and trim (auto-crop)
+  const trimmed = await image.trim().toBuffer();
+  // Center on white 1024x1024 canvas
+  await sharp(trimmed)
+    .resize(1024, 1024, {
+      fit: 'contain',
+      background: { r: 255, g: 255, b: 255, alpha: 1 }
+    })
+    .toFile(outputPath);
+}
+
 async function main() {
   const inputPath = process.argv[2];
   if (!inputPath) {
@@ -286,8 +301,7 @@ async function main() {
   const maskPath = path.join(OUTPUT_DIR, `${filename}_mask.png`);
   const outputPath = path.join(OUTPUT_DIR, `ideal-image-result.png`);
   const noBgPath = path.join(OUTPUT_DIR, `${filename}_no_bg.png`);
-  const prompt = 'Place this product on a clean white studio background with soft lighting. Remove any other objects or background clutter.';
-
+  const prompt = 'Place this product perfectly centered on a pure white seamless studio background with soft, even lighting. Make it look like a professional product photo for an e-commerce website. No shadows, no other objects, no text, and no watermark.';
   try {
     console.log('🚀 [main] Starting enhancement pipeline...');
     await convertToPngAndSquare(inputPath, inputPngPath);
@@ -295,6 +309,7 @@ async function main() {
     await createWhiteMask(noBgPath, maskPath);
     const url = await callDalleEdit(noBgPath, maskPath, prompt, process.env.OPENAI_API_KEY);
     await downloadImage(url, outputPath);
+    await postProcessImage(outputPath, outputPath);
     console.log('🎉 [main] All done! Check your enhanced images in the output folder');
   } catch (err) {
     console.error('❌ [main] Error during enhancement pipeline:', err.message);
