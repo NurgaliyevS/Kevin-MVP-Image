@@ -138,50 +138,219 @@ class ProductPhotoEnhancer {
 async function convertToPngAndSquare(inputPath, outputPngPath) {
   console.log(`🔄 [convertToPngAndSquare] Converting ${inputPath} to 1024x1024 PNG at ${outputPngPath}`);
   await sharp(inputPath)
-    .ensureAlpha() // Ensure alpha channel exists from the start
+    .ensureAlpha()
     .resize(1024, 1024, { 
       fit: 'contain', 
-      background: { r: 0, g: 0, b: 0, alpha: 0 } // Use transparent background
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
     })
-    .png({ quality: 100 }) // Ensure highest quality
+    .png({ quality: 100 })
     .toFile(outputPngPath);
   console.log(`✅ [convertToPngAndSquare] Saved PNG: ${outputPngPath}`);
 }
 
-async function createWhiteMask(inputPngPath, maskPath) {
-  console.log(`🔄 [createWhiteMask] Creating white mask for ${inputPngPath} at ${maskPath}`);
+async function removeBackground(inputPath, outputPath) {
+  try {
+    console.log(`🔄 [removeBackground] Removing background from: ${inputPath}`);
+    
+    if (!fs.existsSync(inputPath)) {
+      throw new Error(`Input file not found: ${inputPath}`);
+    }
 
-  // Read the input image (with alpha channel)
-  const input = sharp(inputPngPath);
-  const { width = 1024, height = 1024 } = await input.metadata();
-  // Extract alpha channel: product is opaque (alpha > 0), background is transparent (alpha == 0)
-  const alpha = await input.ensureAlpha().extractChannel('alpha').toBuffer();
+    if (!process.env.REMOVEBG_API_KEY) {
+      throw new Error('REMOVEBG_API_KEY is not set in environment variables');
+    }
 
-  // Create a white RGBA image
-  const white = Buffer.alloc(width * height * 4, 255);
-  // Set alpha to 0 where the product is (alpha > 0 in input), 255 elsewhere
-  for (let i = 0; i < width * height; i++) {
-    // If input alpha > 0, set mask alpha to 0 (transparent, don't edit)
-    // Else, set mask alpha to 255 (opaque, edit)
-    white[i * 4 + 3] = alpha[i] > 0 ? 0 : 255;
+    const maxRetries = 3;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`[removeBackground] Attempt ${attempt} of ${maxRetries}`);
+        
+        const formData = new FormData();
+        formData.append('size', 'auto');
+        formData.append('image_file', fs.createReadStream(inputPath));
+
+        const response = await axios.post('https://api.remove.bg/v1.0/removebg', formData, {
+          headers: {
+            'X-Api-Key': process.env.REMOVEBG_API_KEY,
+            ...formData.getHeaders()
+          },
+          responseType: 'arraybuffer',
+          timeout: 30000
+        });
+
+        if (response.status === 200 && response.data) {
+          const tempPath = outputPath + '.temp';
+          await fs.promises.writeFile(tempPath, response.data);
+          
+          await sharp(tempPath)
+            .ensureAlpha()
+            .resize(1024, 1024, {
+              fit: 'contain',
+              background: { r: 0, g: 0, b: 0, alpha: 0 }
+            })
+            .png({ quality: 100 })
+            .toFile(outputPath);
+            
+          await fs.promises.unlink(tempPath);
+          
+          console.log(`✅ [removeBackground] Background removed and saved to: ${outputPath}`);
+          return outputPath;
+        }
+      } catch (error) {
+        lastError = error;
+        console.warn(`⚠️ [removeBackground] Attempt ${attempt} failed:`, error.message);
+        
+        if (attempt < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+          continue;
+        }
+      }
+    }
+
+    console.warn('⚠️ [removeBackground] All retry attempts failed, using fallback approach');
+    
+    await sharp(inputPath)
+      .ensureAlpha()
+      .resize(1024, 1024, { 
+        fit: 'contain', 
+        background: { r: 0, g: 0, b: 0, alpha: 0 } 
+      })
+      .png({ quality: 100 })
+      .toFile(outputPath);
+    
+    console.log(`✅ [removeBackground] Fallback: Created transparent version at: ${outputPath}`);
+    return outputPath;
+
+  } catch (error) {
+    console.error('❌ [removeBackground] Error:', error.message);
+    throw error;
   }
-  await sharp(white, { raw: { width, height, channels: 4 } })
-    .png({ quality: 100 })
-    .toFile(maskPath);
-  console.log(`✅ [createWhiteMask] White mask saved: ${maskPath}`);
 }
 
-async function validateImageForDalle(imagePath) {
-  const metadata = await sharp(imagePath).metadata();
-  if (metadata.width !== 1024 || metadata.height !== 1024) {
-    throw new Error(`Image dimensions must be 1024x1024, got ${metadata.width}x${metadata.height}`);
+// Create a proper mask that covers the background area, not the product
+async function createBackgroundMask(inputPngPath, maskPath) {
+  console.log(`🔄 [createBackgroundMask] Creating background mask for ${inputPngPath} at ${maskPath}`);
+  
+  const inputMetadata = await sharp(inputPngPath).metadata();
+  const width = inputMetadata.width || 1024;
+  const height = inputMetadata.height || 1024;
+
+  // Read the input image to get alpha channel
+  const { data, info } = await sharp(inputPngPath)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  // Create mask data - white where transparent (background), black where opaque (product)
+  const maskData = Buffer.alloc(width * height * 4);
+  
+  for (let i = 0; i < data.length; i += 4) {
+    const alpha = data[i + 3];
+    const pixelIndex = i;
+    
+    if (alpha < 128) { // Transparent/semi-transparent areas (background)
+      maskData[pixelIndex] = 255;     // R
+      maskData[pixelIndex + 1] = 255; // G
+      maskData[pixelIndex + 2] = 255; // B
+      maskData[pixelIndex + 3] = 255; // A
+    } else { // Opaque areas (product)
+      maskData[pixelIndex] = 0;       // R
+      maskData[pixelIndex + 1] = 0;   // G
+      maskData[pixelIndex + 2] = 0;   // B
+      maskData[pixelIndex + 3] = 255; // A
+    }
   }
-  if (metadata.format !== 'png') {
-    throw new Error(`Image must be PNG format, got ${metadata.format}`);
+
+  await sharp(maskData, {
+    raw: {
+      width: width,
+      height: height,
+      channels: 4
+    }
+  })
+    .png({ quality: 100 })
+    .toFile(maskPath);
+    
+  console.log(`✅ [createBackgroundMask] Background mask saved: ${maskPath}`);
+}
+
+// Position the product at center-bottom and add white background
+async function repositionProduct(inputPngPath, outputPath) {
+  console.log(`🔄 [repositionProduct] Repositioning product to center-bottom`);
+  
+  const image = sharp(inputPngPath);
+  const { data, info } = await image.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  
+  // Find the bounding box of the non-transparent pixels
+  let minX = info.width, maxX = 0, minY = info.height, maxY = 0;
+  
+  for (let y = 0; y < info.height; y++) {
+    for (let x = 0; x < info.width; x++) {
+      const idx = (y * info.width + x) * 4;
+      if (data[idx + 3] > 0) { // Non-transparent pixel
+        minX = Math.min(minX, x);
+        maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y);
+        maxY = Math.max(maxY, y);
+      }
+    }
   }
-  if (metadata.channels !== 4) {
-    throw new Error(`Image must have alpha channel, got ${metadata.channels} channels`);
+  
+  // Extract the product
+  const productWidth = maxX - minX + 1;
+  const productHeight = maxY - minY + 1;
+  
+  const croppedProduct = await sharp(inputPngPath)
+    .extract({
+      left: minX,
+      top: minY,
+      width: productWidth,
+      height: productHeight
+    })
+    .toBuffer();
+  
+  // Calculate position for center-bottom (bottom 1/3 of image)
+  const canvasWidth = 1024;
+  const canvasHeight = 1024;
+  const targetWidth = Math.min(productWidth, Math.floor(canvasWidth * 0.8)); // Max 80% of canvas width
+  const targetHeight = Math.min(productHeight, Math.floor(canvasHeight * 0.6)); // Max 60% of canvas height
+  
+  // Resize if needed while maintaining aspect ratio
+  let resizedProduct = croppedProduct;
+  if (productWidth > targetWidth || productHeight > targetHeight) {
+    resizedProduct = await sharp(croppedProduct)
+      .resize(targetWidth, targetHeight, { fit: 'inside', withoutEnlargement: true })
+      .toBuffer();
   }
+  
+  const resizedMeta = await sharp(resizedProduct).metadata();
+  const finalWidth = resizedMeta.width;
+  const finalHeight = resizedMeta.height;
+  
+  // Position at center-bottom
+  const left = Math.round((canvasWidth - finalWidth) / 2);
+  const top = Math.round(canvasHeight - finalHeight - (canvasHeight * 0.1)); // 10% from bottom
+  
+  // Create final image with white background
+  await sharp({
+    create: {
+      width: canvasWidth,
+      height: canvasHeight,
+      channels: 3,
+      background: { r: 255, g: 255, b: 255 }
+    }
+  })
+    .composite([{
+      input: resizedProduct,
+      left: left,
+      top: top
+    }])
+    .png({ quality: 100 })
+    .toFile(outputPath);
+    
+  console.log(`✅ [repositionProduct] Product repositioned and saved to: ${outputPath}`);
 }
 
 async function callDalleEdit(inputPngPath, maskPath, prompt, apiKey) {
@@ -189,44 +358,14 @@ async function callDalleEdit(inputPngPath, maskPath, prompt, apiKey) {
   const openai = new OpenAI({ apiKey });
 
   try {
-    // Validate images before sending to DALL-E
-    const inputMetadata = await sharp(inputPngPath).metadata();
-    const maskMetadata = await sharp(maskPath).metadata();
+    const imageBuffer = await fs.promises.readFile(inputPngPath);
+    const maskBuffer = await fs.promises.readFile(maskPath);
     
-    let finalInputPath = inputPngPath;
-    let finalMaskPath = maskPath;
-    
-    if (inputMetadata.channels !== 4) {
-      // If input doesn't have alpha channel, add it to a temp file
-      const tempInputPath = inputPngPath + '.temp.png';
-      await sharp(inputPngPath)
-        .ensureAlpha()
-        .png()
-        .toFile(tempInputPath);
-      finalInputPath = tempInputPath;
-    }
-    
-    if (maskMetadata.channels !== 4) {
-      // If mask doesn't have alpha channel, add it to a temp file
-      const tempMaskPath = maskPath + '.temp.png';
-      await sharp(maskPath)
-        .ensureAlpha()
-        .png()
-        .toFile(tempMaskPath);
-      finalMaskPath = tempMaskPath;
-    }
-
-    // Read files as buffers
-    const imageBuffer = await fs.promises.readFile(finalInputPath);
-    const maskBuffer = await fs.promises.readFile(finalMaskPath);
-    
-    // Create proper File objects with correct MIME type
-    const image = new File([imageBuffer], path.basename(finalInputPath), { type: 'image/png' });
-    const mask = new File([maskBuffer], path.basename(finalMaskPath), { type: 'image/png' });
+    const image = new File([imageBuffer], path.basename(inputPngPath), { type: 'image/png' });
+    const mask = new File([maskBuffer], path.basename(maskPath), { type: 'image/png' });
 
     console.log(`[callDalleEdit] Prompt: ${prompt}`);
     
-    // Add retry logic for DALL-E API call
     const maxRetries = 3;
     let lastError = null;
 
@@ -246,15 +385,6 @@ async function callDalleEdit(inputPngPath, maskPath, prompt, apiKey) {
         if (response.data && response.data[0] && response.data[0].url) {
           const url = response.data[0].url;
           console.log(`✅ [callDalleEdit] OpenAI returned image URL: ${url}`);
-          
-          // Clean up temporary files if they were created
-          if (finalInputPath !== inputPngPath) {
-            await fs.promises.unlink(finalInputPath);
-          }
-          if (finalMaskPath !== maskPath) {
-            await fs.promises.unlink(finalMaskPath);
-          }
-          
           return url;
         } else {
           throw new Error('Invalid response format from DALL-E API');
@@ -264,19 +394,10 @@ async function callDalleEdit(inputPngPath, maskPath, prompt, apiKey) {
         console.warn(`⚠️ [callDalleEdit] Attempt ${attempt} failed:`, error.message);
         
         if (attempt < maxRetries) {
-          // Wait before retrying (exponential backoff)
           await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
           continue;
         }
       }
-    }
-
-    // Clean up temporary files if they were created
-    if (finalInputPath !== inputPngPath) {
-      await fs.promises.unlink(finalInputPath);
-    }
-    if (finalMaskPath !== maskPath) {
-      await fs.promises.unlink(finalMaskPath);
     }
 
     throw lastError || new Error('All DALL-E API attempts failed');
@@ -293,139 +414,39 @@ async function downloadImage(url, outputPath) {
   console.log(`✅ [downloadImage] Image saved to: ${outputPath}`);
 }
 
-async function removeBackground(inputPath, outputPath) {
-  try {
-    console.log(`🔄 [removeBackground] Removing background from: ${inputPath}`);
-    
-    // Validate input file exists
-    if (!fs.existsSync(inputPath)) {
-      throw new Error(`Input file not found: ${inputPath}`);
-    }
-
-    // Validate API key
-    if (!process.env.REMOVEBG_API_KEY) {
-      throw new Error('REMOVEBG_API_KEY is not set in environment variables');
-    }
-
-    // Add timeout and retry logic
-    const maxRetries = 3;
-    let lastError = null;
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        console.log(`[removeBackground] Attempt ${attempt} of ${maxRetries}`);
-        
-        // Create form data
-        const formData = new FormData();
-        formData.append('size', 'auto');
-        formData.append('image_file', fs.createReadStream(inputPath));
-
-        const response = await axios.post('https://api.remove.bg/v1.0/removebg', formData, {
-          headers: {
-            'X-Api-Key': process.env.REMOVEBG_API_KEY,
-            ...formData.getHeaders()
-          },
-          responseType: 'arraybuffer',
-          timeout: 30000 // 30 second timeout
-        });
-
-        if (response.status === 200 && response.data) {
-          // Save the response to a temporary file
-          const tempPath = outputPath + '.temp';
-          await fs.promises.writeFile(tempPath, response.data);
-          
-          // Process the image to ensure it has an alpha channel
-          await sharp(tempPath)
-            .ensureAlpha() // Ensure alpha channel exists
-            .resize(1024, 1024, {
-              fit: 'contain',
-              background: { r: 0, g: 0, b: 0, alpha: 0 }
-            })
-            .png({ quality: 100 })
-            .toFile(outputPath);
-            
-          // Clean up temporary file
-          await fs.promises.unlink(tempPath);
-          
-          console.log(`✅ [removeBackground] Background removed and saved to: ${outputPath}`);
-          return outputPath;
-        }
-      } catch (error) {
-        lastError = error;
-        console.warn(`⚠️ [removeBackground] Attempt ${attempt} failed:`, error.message);
-        
-        if (attempt < maxRetries) {
-          // Wait before retrying (exponential backoff)
-          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
-          continue;
-        }
-      }
-    }
-
-    // If all retries failed, use a fallback approach
-    console.warn('⚠️ [removeBackground] All retry attempts failed, using fallback approach');
-    
-    // Fallback: Create a transparent background version
-    await sharp(inputPath)
-      .ensureAlpha() // Ensure alpha channel exists
-      .resize(1024, 1024, { 
-        fit: 'contain', 
-        background: { r: 0, g: 0, b: 0, alpha: 0 } 
-      })
-      .png({ quality: 100 })
-      .toFile(outputPath);
-    
-    console.log(`✅ [removeBackground] Fallback: Created transparent version at: ${outputPath}`);
-    return outputPath;
-
-  } catch (error) {
-    console.error('❌ [removeBackground] Error:', error.message);
-    throw error;
-  }
-}
-
-// Post-process: auto-crop, center, and ensure pure white background
+// Enhanced post-processing for pure white background
 async function postProcessImage(inputPath, outputPath) {
   try {
-    // Trim the image to the product
-    const trimmedBuffer = await sharp(inputPath).trim().toBuffer();
-    const trimmedMeta = await sharp(trimmedBuffer).metadata();
-    // Create a white canvas
-    const canvas = sharp({
-      create: {
-        width: 1024,
-        height: 1024,
-        channels: 4,
-        background: { r: 255, g: 255, b: 255, alpha: 1 }
+    console.log(`🔄 [postProcessImage] Post-processing image: ${inputPath}`);
+    
+    // Read the image
+    const image = sharp(inputPath);
+    const { data, info } = await image.raw().toBuffer({ resolveWithObject: true });
+    
+    // Process pixels to ensure pure white background
+    for (let i = 0; i < data.length; i += info.channels) {
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      
+      // If pixel is very light (near white), make it pure white
+      if (r > 230 && g > 230 && b > 230) {
+        data[i] = 255;     // R
+        data[i + 1] = 255; // G
+        data[i + 2] = 255; // B
       }
-    });
-    // Calculate left offset to center horizontally, top offset to align at bottom
-    const left = Math.floor((1024 - trimmedMeta.width) / 2);
-    const top = 1024 - trimmedMeta.height;
-    // Composite trimmed product onto canvas
-    await canvas
-      .composite([{ input: trimmedBuffer, left, top }])
+    }
+    
+    // Save the processed image
+    await sharp(data, { raw: info })
       .png({ quality: 100 })
       .toFile(outputPath);
+      
+    console.log(`✅ [postProcessImage] Post-processed image saved: ${outputPath}`);
   } catch (error) {
     console.error('❌ [postProcessImage] Error:', error.message);
     throw error;
   }
-}
-
-async function ensurePureWhiteBackground(inputPath, outputPath) {
-  // Replace all near-white pixels with pure white
-  const image = sharp(inputPath);
-  const { data, info } = await image.raw().toBuffer({ resolveWithObject: true });
-  for (let i = 0; i < data.length; i += info.channels) {
-    // If R,G,B are all above 240, set to 255 (pure white)
-    if (data[i] > 240 && data[i+1] > 240 && data[i+2] > 240) {
-      data[i] = 255; data[i+1] = 255; data[i+2] = 255;
-    }
-  }
-  await sharp(data, { raw: info })
-    .toFormat('png')
-    .toFile(outputPath);
 }
 
 async function main() {
@@ -445,24 +466,58 @@ async function main() {
   if (!fs.existsSync(OUTPUT_DIR)) {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   }
+
   const filename = path.basename(inputPath, path.extname(inputPath));
   const inputPngPath = path.join(OUTPUT_DIR, `${filename}_input.png`);
-  const maskPath = path.join(OUTPUT_DIR, `${filename}_mask.png`);
-  const outputPath = path.join(OUTPUT_DIR, `ideal-image-result.png`);
   const noBgPath = path.join(OUTPUT_DIR, `${filename}_no_bg.png`);
-  const prompt = 'Place the product at the center bottom of the image on a pure white background. No shadows, no other objects, no text, no watermark. The product should be large, clear, and well-lit, like a professional e-commerce studio photo. The background must be pure white (RGB 255,255,255).';
+  const repositionedPath = path.join(OUTPUT_DIR, `${filename}_repositioned.png`);
+  const maskPath = path.join(OUTPUT_DIR, `${filename}_mask.png`);
+  const dalleOutputPath = path.join(OUTPUT_DIR, `${filename}_dalle_output.png`);
+  const outputPath = path.join(OUTPUT_DIR, `ideal-image-result.png`);
+  
+  // Updated prompt for better results
+  const prompt = 'Professional e-commerce product photo with pure white background, studio lighting, no shadows, clean and minimal, product clearly visible and well-lit';
+
   try {
-    console.log('🚀 [main] Starting enhancement pipeline...');
+    console.log('🚀 [main] Starting enhanced pipeline...');
+    
+    // Step 1: Convert to PNG and resize
     await convertToPngAndSquare(inputPath, inputPngPath);
+    
+    // Step 2: Remove background
     await removeBackground(inputPngPath, noBgPath);
-    await createWhiteMask(noBgPath, maskPath);
-    const url = await callDalleEdit(noBgPath, maskPath, prompt, process.env.OPENAI_API_KEY);
-    await downloadImage(url, outputPath);
-    await postProcessImage(outputPath, outputPath);
-    await ensurePureWhiteBackground(outputPath, outputPath);
-    console.log('🎉 [main] All done! Check your enhanced images in the output folder');
+    
+    // Step 3: Reposition product to center-bottom with white background
+    await repositionProduct(noBgPath, repositionedPath);
+    
+    // Step 4: Create background mask for DALL-E
+    await createBackgroundMask(noBgPath, maskPath);
+    
+    // Step 5: Use DALL-E to enhance the background and overall look
+    const url = await callDalleEdit(repositionedPath, maskPath, prompt, process.env.OPENAI_API_KEY);
+    
+    // Step 6: Download the result
+    await downloadImage(url, dalleOutputPath);
+    
+    // Step 7: Final post-processing for pure white background
+    await postProcessImage(dalleOutputPath, outputPath);
+    
+    console.log('🎉 [main] All done! Check your enhanced image at: output/ideal-image-result.png');
+    
   } catch (err) {
     console.error('❌ [main] Error during enhancement pipeline:', err.message);
+    
+    // Fallback: If DALL-E fails, use the repositioned version
+    try {
+      console.log('🔄 [main] Using fallback approach...');
+      if (fs.existsSync(repositionedPath)) {
+        await fs.promises.copyFile(repositionedPath, outputPath);
+        console.log('✅ [main] Fallback image saved to: output/ideal-image-result.png');
+      }
+    } catch (fallbackError) {
+      console.error('❌ [main] Fallback also failed:', fallbackError.message);
+    }
+    
     process.exit(1);
   }
 }
@@ -471,5 +526,4 @@ if (require.main === module) {
   main();
 }
 
-// Export for use as module
 module.exports = ProductPhotoEnhancer;
