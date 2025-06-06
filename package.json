@@ -1,0 +1,25 @@
+{
+    "name": "dog-park-photo-enhancer",
+    "version": "1.0.0",
+    "description": "Studio quality product photo enhancement for Dog Park Daywear without logo hallucination",
+    "main": "enhance.js",
+    "scripts": {
+      "start": "node enhance.js",
+      "enhance": "node enhance.js",
+      "test": "node enhance.js ./test-image.jpg"
+    },
+    "dependencies": {
+      "sharp": "^0.32.6",
+      "openai": "^4.38.0",
+      "axios": "^1.6.7",
+      "dotenv": "^16.4.5"
+    },
+    "keywords": [
+      "image-processing",
+      "product-photography",
+      "clothing-brand",
+      "photo-enhancement"
+    ],
+    "author": "Dog Park Daywear",
+    "license": "MIT"
+  }

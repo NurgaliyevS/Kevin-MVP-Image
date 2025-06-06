@@ -1,0 +1,46 @@
+Logo-on-Phone MVP Architecture
+Frontend: A simple web page (e.g. React/HTML/JS) lets users upload two images: the product photo (the phone) and the logo image. The frontend sends these to our backend via an API call, then displays the generated result.
+Backend: A small serverless or containerized service (e.g. Python/Node) handles the processing. It receives the images, calls OpenAI’s image API (DALL·E) to remove the background and stylize the photo, then applies the user’s logo. The backend returns the final image to the frontend. No other AI models or self-hosted tools are needed – only OpenAI’s hosted image API and simple image operations.
+This flow uses DALL·E’s image edit capabilities: we upload the phone image plus a mask to tell DALL·E which part to redraw, and a text prompt to request a clean studio background
+medium.com
+. In practice, we give DALL·E the product photo and a mask that covers the background (leaving the phone opaque). The prompt instructs it to “remove all background and place the phone on a neutral white studio background.” This yields a 1024×1024 PNG of the phone in a professional lighting setup, as shown by OpenAI’s own examples of product beautification
+photoroom.com
+. Because DALL·E image-editing uses user-supplied masks and input images, we retain the exact phone design and only change what we intend
+medium.com
+. In other words, the model edit is constrained by our inputs, so it won’t arbitrarily alter the phone or invent a new logo.
+Step-by-Step Flow
+User Uploads Images: The user selects a product photo and a logo file (PNG) via the frontend UI. Both images are sent to the backend.
+Prepare for DALL·E: On the backend, convert or crop the product photo to a 1:1 square (1024×1024 PNG). Create a mask image (also 1024×1024 PNG) that marks the background as transparent and the phone area as opaque
+medium.com
+. This tells DALL·E to redraw only the background region.
+Call DALL·E to Remove Background: Use the OpenAI Image Editing API (create_image_edit) with the product image and mask. The prompt might be:
+“Place this smartphone on a clean white studio background with soft lighting. Remove any other objects or background clutter.”
+DALL·E returns a new image of the same phone on a white studio-like background. (This is analogous to the “Product Beautifier” feature in Photoroom, which uses OpenAI’s model to give a “studio-quality upgrade” to a product photo
+photoroom.com
+.)
+Overlay the Logo: Now that we have the phone on a neutral background, we add the exact user-provided logo image at a default position (e.g. centered on the phone’s back or bottom corner). This is done with a simple image-compositing step (e.g. using Python’s PIL or HTML canvas): place the PNG logo onto the DALL·E output image at the chosen coordinates. No AI model is involved in this step – we are literally pasting the user’s logo file onto the photo.
+Return Final Image: The backend sends the composite image back to the frontend. The result is a studio-quality photo of the phone with the correct logo placed on it. Since the actual logo file was overlaid, there is no possibility of a wrong or invented logo. The only generative step (DALL·E) was used for background and lighting, not to design any logo.
+This pipeline uses the fewest steps needed: one DALL·E API call for background/styling, plus one image merge. (In principle, one could attempt a second DALL·E edit call to “add logo,” but that would risk hallucination since we can’t feed the raw logo image into the prompt. Instead we simply overlay the logo exactly. The result is correct by construction.)
+Sample User Flow
+Step 1 (Upload): User opens the web app, clicks “Choose File” to select a phone product photo and a company logo PNG. Both images show as previews on the page.
+Step 2 (Generate): User clicks “Generate Studio Image.” The app sends the files to the backend, and shows a loading indicator (“Creating image…”).
+Step 3 (Processing): In the background, the server calls DALL·E and combines the logo as described.
+Step 4 (Result): The final image (phone + logo on white background) appears on the page. User can download or share it. The phone looks like a professional product shot, and the logo is exactly the one they provided (no strange changes).
+Example OpenAI API Call
+Below is an illustrative Python call using the openai library. We use create_edit with the phone image and mask, and ask for a white studio background. (This follows OpenAI’s example of editing with image+mask
+medium.com
+.)
+python
+Copy
+Edit
+response = openai.Image.create_edit(
+    image=open("phone_photo.png", "rb"),
+    mask=open("background_mask.png", "rb"),
+    prompt="Place this smartphone on a clean white studio background with soft lighting, remove any other objects.",
+    n=1,
+    size="1024x1024",
+    model="dall-e-3"
+)
+edited_image_url = response['data'][0]['url']
+In this sample call, phone_photo.png is the user’s product image and background_mask.png has the phone area masked out. DALL·E returns a URL for the new image. (After downloading it, we would overlay the logo on top in code.) This usage is consistent with OpenAI’s documentation: the mask image defines where the AI should generate new content
+medium.com
