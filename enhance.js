@@ -150,22 +150,24 @@ async function convertToPngAndSquare(inputPath, outputPngPath) {
 
 async function createWhiteMask(inputPngPath, maskPath) {
   console.log(`🔄 [createWhiteMask] Creating white mask for ${inputPngPath} at ${maskPath}`);
-  
-  // First read the input image to get its dimensions
-  const inputMetadata = await sharp(inputPngPath).metadata();
-  
-  // Create a white mask with alpha channel
-  await sharp({
-    create: {
-      width: inputMetadata.width || 1024,
-      height: inputMetadata.height || 1024,
-      channels: 4, // Explicitly set to 4 channels (RGBA)
-      background: { r: 255, g: 255, b: 255, alpha: 1 }
-    }
-  })
-    .png({ quality: 100 }) // Ensure highest quality
+
+  // Read the input image (with alpha channel)
+  const input = sharp(inputPngPath);
+  const { width = 1024, height = 1024 } = await input.metadata();
+  // Extract alpha channel: product is opaque (alpha > 0), background is transparent (alpha == 0)
+  const alpha = await input.ensureAlpha().extractChannel('alpha').toBuffer();
+
+  // Create a white RGBA image
+  const white = Buffer.alloc(width * height * 4, 255);
+  // Set alpha to 0 where the product is (alpha > 0 in input), 255 elsewhere
+  for (let i = 0; i < width * height; i++) {
+    // If input alpha > 0, set mask alpha to 0 (transparent, don't edit)
+    // Else, set mask alpha to 255 (opaque, edit)
+    white[i * 4 + 3] = alpha[i] > 0 ? 0 : 255;
+  }
+  await sharp(white, { raw: { width, height, channels: 4 } })
+    .png({ quality: 100 })
     .toFile(maskPath);
-    
   console.log(`✅ [createWhiteMask] White mask saved: ${maskPath}`);
 }
 
@@ -385,17 +387,25 @@ async function removeBackground(inputPath, outputPath) {
 // Post-process: auto-crop, center, and ensure pure white background
 async function postProcessImage(inputPath, outputPath) {
   try {
-    // Open the image
-    const image = sharp(inputPath);
-    // Get alpha channel and trim (auto-crop)
-    const trimmed = await image.trim().toBuffer();
-    // Center on white 1024x1024 canvas
-    await sharp(trimmed)
-      .resize(1024, 1024, {
-        fit: 'contain',
+    // Trim the image to the product
+    const trimmedBuffer = await sharp(inputPath).trim().toBuffer();
+    const trimmedMeta = await sharp(trimmedBuffer).metadata();
+    // Create a white canvas
+    const canvas = sharp({
+      create: {
+        width: 1024,
+        height: 1024,
+        channels: 4,
         background: { r: 255, g: 255, b: 255, alpha: 1 }
-      })
-      .png({ quality: 100 }) // Ensure highest quality
+      }
+    });
+    // Calculate left offset to center horizontally, top offset to align at bottom
+    const left = Math.floor((1024 - trimmedMeta.width) / 2);
+    const top = 1024 - trimmedMeta.height;
+    // Composite trimmed product onto canvas
+    await canvas
+      .composite([{ input: trimmedBuffer, left, top }])
+      .png({ quality: 100 })
       .toFile(outputPath);
   } catch (error) {
     console.error('❌ [postProcessImage] Error:', error.message);
@@ -440,7 +450,7 @@ async function main() {
   const maskPath = path.join(OUTPUT_DIR, `${filename}_mask.png`);
   const outputPath = path.join(OUTPUT_DIR, `ideal-image-result.png`);
   const noBgPath = path.join(OUTPUT_DIR, `${filename}_no_bg.png`);
-  const prompt = 'Place the product at the center bottom on a pure white background, like a professional e-commerce studio photo. No shadows, no other objects, no text, no watermark. The product should be large, clear, and well-lit.';
+  const prompt = 'Place the product at the center bottom of the image on a pure white background. No shadows, no other objects, no text, no watermark. The product should be large, clear, and well-lit, like a professional e-commerce studio photo. The background must be pure white (RGB 255,255,255).';
   try {
     console.log('🚀 [main] Starting enhancement pipeline...');
     await convertToPngAndSquare(inputPath, inputPngPath);
@@ -448,8 +458,8 @@ async function main() {
     await createWhiteMask(noBgPath, maskPath);
     const url = await callDalleEdit(noBgPath, maskPath, prompt, process.env.OPENAI_API_KEY);
     await downloadImage(url, outputPath);
-    await ensurePureWhiteBackground(outputPath, outputPath);
     await postProcessImage(outputPath, outputPath);
+    await ensurePureWhiteBackground(outputPath, outputPath);
     console.log('🎉 [main] All done! Check your enhanced images in the output folder');
   } catch (err) {
     console.error('❌ [main] Error during enhancement pipeline:', err.message);
