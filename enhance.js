@@ -5,6 +5,10 @@ const fs = require('fs');
 const path = require('path');
 const { Configuration, OpenAIApi } = require('openai');
 const axios = require('axios');
+const OpenAI = require('openai');
+const { fileFromPath } = require("openai/uploads");
+
+const OUTPUT_DIR = './output';
 
 class ProductPhotoEnhancer {
   constructor() {
@@ -130,74 +134,90 @@ class ProductPhotoEnhancer {
   }
 }
 
-async function createWhiteMask(inputPath, maskPath) {
-  // Create a white mask (fully opaque) for the product area, transparent elsewhere
-  // For simplicity, use a fully white mask (user can refine this for better results)
-  const image = sharp(inputPath);
-  const { width, height } = await image.metadata();
+async function convertToPngAndSquare(inputPath, outputPngPath) {
+  console.log(`🔄 [convertToPngAndSquare] Converting ${inputPath} to 1024x1024 PNG at ${outputPngPath}`);
+  await sharp(inputPath)
+    .resize(1024, 1024, { fit: 'contain', background: { r: 255, g: 255, b: 255, alpha: 1 } })
+    .png()
+    .toFile(outputPngPath);
+  console.log(`✅ [convertToPngAndSquare] Saved PNG: ${outputPngPath}`);
+}
+
+async function createWhiteMask(inputPngPath, maskPath) {
+  console.log(`🔄 [createWhiteMask] Creating white mask for ${inputPngPath} at ${maskPath}`);
   await sharp({
     create: {
-      width,
-      height,
+      width: 1024,
+      height: 1024,
       channels: 4,
       background: { r: 255, g: 255, b: 255, alpha: 1 }
     }
   })
     .png()
     .toFile(maskPath);
+  console.log(`✅ [createWhiteMask] White mask saved: ${maskPath}`);
 }
 
-async function callDalleEdit(inputPath, maskPath, prompt, apiKey) {
-  const configuration = new Configuration({ apiKey });
-  const openai = new OpenAIApi(configuration);
-  const image = fs.createReadStream(inputPath);
-  const mask = fs.createReadStream(maskPath);
-  const response = await openai.createImageEdit(
+async function callDalleEdit(inputPngPath, maskPath, prompt, apiKey) {
+  console.log(`🔄 [callDalleEdit] Calling OpenAI API with image: ${inputPngPath}, mask: ${maskPath}`);
+  const openai = new OpenAI({ apiKey });
+
+  // Read files as buffers and create proper File objects
+  const imageBuffer = await fs.promises.readFile(inputPngPath);
+  const maskBuffer = await fs.promises.readFile(maskPath);
+  
+  const image = new File([imageBuffer], path.basename(inputPngPath), { type: 'image/png' });
+  const mask = new File([maskBuffer], path.basename(maskPath), { type: 'image/png' });
+
+  console.log(`[callDalleEdit] Prompt: ${prompt}`);
+  const response = await openai.images.edit({
     image,
     mask,
     prompt,
-    1,
-    '1024x1024',
-    undefined,
-    'dall-e-3'
-  );
-  return response.data.data[0].url;
+    n: 1,
+    size: '1024x1024',
+    model: 'dall-e-2'
+  });
+  const url = response.data[0].url;
+  console.log(`✅ [callDalleEdit] OpenAI returned image URL: ${url}`);
+  return url;
 }
 
 async function downloadImage(url, outputPath) {
+  console.log(`🔄 [downloadImage] Downloading image from: ${url}`);
   const response = await axios.get(url, { responseType: 'arraybuffer' });
   await fs.promises.writeFile(outputPath, response.data);
+  console.log(`✅ [downloadImage] Image saved to: ${outputPath}`);
 }
 
 async function main() {
-  const args = process.argv.slice(2);
-  if (args.length < 1) {
+  const inputPath = process.argv[2];
+  if (!inputPath) {
     console.log('Usage: node enhance.js <input-image-path>');
     process.exit(1);
   }
-  const inputPath = args[0];
-  if (!fs.existsSync(inputPath)) {
-    console.error('Input file not found:', inputPath);
-    process.exit(1);
-  }
   if (!process.env.OPENAI_API_KEY) {
-    console.error('Please set your OPENAI_API_KEY environment variable.');
+    console.error('❌ Please set your OPENAI_API_KEY environment variable.');
     process.exit(1);
   }
   if (!fs.existsSync(OUTPUT_DIR)) {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   }
   const filename = path.basename(inputPath, path.extname(inputPath));
+  const inputPngPath = path.join(OUTPUT_DIR, `${filename}_input.png`);
   const maskPath = path.join(OUTPUT_DIR, `${filename}_mask.png`);
-  const outputPath = path.join(OUTPUT_DIR, `enhanced_${filename}.png`);
+  const outputPath = path.join(OUTPUT_DIR, `ideal-image.png`);
   const prompt = 'Place this product on a clean white studio background with soft lighting. Remove any other objects or background clutter.';
+
   try {
-    await createWhiteMask(inputPath, maskPath);
-    const url = await callDalleEdit(inputPath, maskPath, prompt, process.env.OPENAI_API_KEY);
+    console.log('🚀 [main] Starting enhancement pipeline...');
+    await convertToPngAndSquare(inputPath, inputPngPath);
+    await createWhiteMask(inputPngPath, maskPath);
+    const url = await callDalleEdit(inputPngPath, maskPath, prompt, process.env.OPENAI_API_KEY);
     await downloadImage(url, outputPath);
-    console.log('✅ Enhanced image saved to:', outputPath);
+    console.log('🎉 [main] All done! Check your enhanced image in the output folder as ideal-image.png');
   } catch (err) {
-    console.error('❌ Error:', err.message);
+    console.error('❌ [main] Error during enhancement pipeline:', err.message);
     process.exit(1);
   }
 }
