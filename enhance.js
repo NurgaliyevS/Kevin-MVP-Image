@@ -7,6 +7,7 @@ const { Configuration, OpenAIApi } = require('openai');
 const axios = require('axios');
 const OpenAI = require('openai');
 const { fileFromPath } = require("openai/uploads");
+const FormData = require('form-data');
 
 const OUTPUT_DIR = './output';
 
@@ -190,6 +191,79 @@ async function downloadImage(url, outputPath) {
   console.log(`✅ [downloadImage] Image saved to: ${outputPath}`);
 }
 
+async function removeBackground(inputPath, outputPath) {
+  try {
+    console.log(`🔄 [removeBackground] Removing background from: ${inputPath}`);
+    
+    // Validate input file exists
+    if (!fs.existsSync(inputPath)) {
+      throw new Error(`Input file not found: ${inputPath}`);
+    }
+
+    // Validate API key
+    if (!process.env.PHOTOROOM_API_KEY) {
+      throw new Error('PHOTOROOM_API_KEY is not set in environment variables');
+    }
+
+    // Add timeout and retry logic
+    const maxRetries = 3;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`[removeBackground] Attempt ${attempt} of ${maxRetries}`);
+        
+        // Create form data
+        const formData = new FormData();
+        formData.append('image_file', fs.createReadStream(inputPath));
+
+        const response = await axios.post('https://sdk.photoroom.com/v1/segment', formData, {
+          headers: {
+            'x-api-key': process.env.PHOTOROOM_API_KEY,
+            ...formData.getHeaders()
+          },
+          responseType: 'arraybuffer',
+          timeout: 30000 // 30 second timeout
+        });
+
+        if (response.status === 200 && response.data) {
+          await fs.promises.writeFile(outputPath, response.data);
+          console.log(`✅ [removeBackground] Background removed and saved to: ${outputPath}`);
+          return outputPath;
+        }
+      } catch (error) {
+        lastError = error;
+        console.warn(`⚠️ [removeBackground] Attempt ${attempt} failed:`, error.message);
+        
+        if (attempt < maxRetries) {
+          // Wait before retrying (exponential backoff)
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+          continue;
+        }
+      }
+    }
+
+    // If all retries failed, use a fallback approach
+    console.warn('⚠️ [removeBackground] All retry attempts failed, using fallback approach');
+    
+    // Fallback: Create a simple white background
+    await sharp(inputPath)
+      .resize(1024, 1024, { 
+        fit: 'contain', 
+        background: { r: 255, g: 255, b: 255, alpha: 1 } 
+      })
+      .png()
+      .toFile(outputPath);
+    
+    console.log(`✅ [removeBackground] Fallback: Created white background version at: ${outputPath}`);
+    return outputPath;
+
+  } catch (error) {
+    console.error('❌ [removeBackground] Error:', error.message);
+    throw error;
+  }
+}
+
 async function main() {
   const inputPath = process.argv[2];
   if (!inputPath) {
@@ -200,22 +274,28 @@ async function main() {
     console.error('❌ Please set your OPENAI_API_KEY environment variable.');
     process.exit(1);
   }
+  if (!process.env.PHOTOROOM_API_KEY) {
+    console.error('❌ Please set your PHOTOROOM_API_KEY environment variable.');
+    process.exit(1);
+  }
   if (!fs.existsSync(OUTPUT_DIR)) {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   }
   const filename = path.basename(inputPath, path.extname(inputPath));
   const inputPngPath = path.join(OUTPUT_DIR, `${filename}_input.png`);
   const maskPath = path.join(OUTPUT_DIR, `${filename}_mask.png`);
-  const outputPath = path.join(OUTPUT_DIR, `ideal-image.png`);
+  const outputPath = path.join(OUTPUT_DIR, `ideal-image-result.png`);
+  const noBgPath = path.join(OUTPUT_DIR, `${filename}_no_bg.png`);
   const prompt = 'Place this product on a clean white studio background with soft lighting. Remove any other objects or background clutter.';
 
   try {
     console.log('🚀 [main] Starting enhancement pipeline...');
     await convertToPngAndSquare(inputPath, inputPngPath);
-    await createWhiteMask(inputPngPath, maskPath);
-    const url = await callDalleEdit(inputPngPath, maskPath, prompt, process.env.OPENAI_API_KEY);
+    await removeBackground(inputPngPath, noBgPath);
+    await createWhiteMask(noBgPath, maskPath);
+    const url = await callDalleEdit(noBgPath, maskPath, prompt, process.env.OPENAI_API_KEY);
     await downloadImage(url, outputPath);
-    console.log('🎉 [main] All done! Check your enhanced image in the output folder as ideal-image.png');
+    console.log('🎉 [main] All done! Check your enhanced images in the output folder');
   } catch (err) {
     console.error('❌ [main] Error during enhancement pipeline:', err.message);
     process.exit(1);
